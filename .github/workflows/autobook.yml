@@ -1,0 +1,92 @@
+name: Parkly Auto Booker
+
+on:
+  schedule:
+    # Parkly legger ut plassene kl. 13:00 norsk tid dagen før.
+    # GitHub bruker UTC og kan forsinke eller droppe planlagte jobber, så vi har
+    # tre starttider (ca. 12:10, 12:30 og 12:45 norsk tid). Den første som starter
+    # venter til 13:00 og booker; de neste ser at det er gjort og avslutter.
+    # Begge sett med tider står her slik at det virker både sommer- og vintertid.
+    # 0-4 = søndag-torsdag (booker mandag-fredag).
+    - cron: '10 10 * * 0-4'   # sommertid 12:10
+    - cron: '30 10 * * 0-4'   # sommertid 12:30
+    - cron: '45 10 * * 0-4'   # sommertid 12:45
+    - cron: '10 11 * * 0-4'   # vintertid 12:10
+    - cron: '30 11 * * 0-4'   # vintertid 12:30
+    - cron: '45 11 * * 0-4'   # vintertid 12:45
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Hva skal kjøres?"
+        type: choice
+        default: test-innlogging
+        options:
+          - test-innlogging
+          - dry-run
+          - book-naa
+          - vent-til-13
+
+concurrency:
+  group: parkly-booker
+  cancel-in-progress: false
+
+jobs:
+  reserve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # Malen selv (uten secrets) skal ikke kjøre
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.is_template
+
+    steps:
+      - name: Sjekk tidspunkt
+        id: gate
+        run: |
+          now=$(TZ=Europe/Oslo date +%H%M)
+          echo "Klokka i Oslo: $now"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$now" -lt 1200 ]; then
+            echo "For tidlig, en senere planlagt kjøring tar det."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Book parkering
+        if: steps.gate.outputs.go == 'true'
+        env:
+          PARKLY_USERNAME: ${{ secrets.PARKLY_USERNAME }}
+          PARKLY_PASSWORD: ${{ secrets.PARKLY_PASSWORD }}
+          PARKLY_ASSIGNMENT_ID: ${{ secrets.PARKLY_ASSIGNMENT_ID }}
+          RELEASE_TIME: "13:00"
+          DEADLINE: "16:00"
+          START_WINDOW_MIN: "65"
+          MODE: ${{ inputs.mode || 'schedule' }}
+        run: |
+          case "$MODE" in
+            dry-run)         python parkly.py --dry-run --now ;;
+            book-naa)        python parkly.py --now ;;
+            test-innlogging) python parkly.py --check-token ;;
+            *)               python parkly.py ;;
+          esac
+
+      - name: Last opp skjermbilder hvis innloggingen feilet
+        if: failure() && github.event.repository.private
+        uses: actions/upload-artifact@v4
+        with:
+          name: innlogging-debug
+          path: debug/
+          if-no-files-found: ignore
